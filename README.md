@@ -35,7 +35,7 @@ pip install tqdm
 
 ### Dataset structure
 
-    ├── COCO 
+    ├── Person 
         ├── images
             ├── train2017
                 ├── 1111.jpg
