@@ -1,8 +1,8 @@
-import argparse
 import copy
 import csv
 import os
 import warnings
+from argparse import ArgumentParser
 
 import numpy
 import torch
@@ -25,11 +25,14 @@ def learning_rate(args, params):
 
 
 def train(args, params):
-    # Model
-    model = nn.yolo_v8_n(len(params['names'].values()))
-    model = util.load_weight('./weights/v8_n.pt', model)
+    util.setup_seed()
+    util.setup_multi_processes()
 
+    # Model
+    model = nn.yolo_v8_n(len(params['names']))
+    model = util.load_weight('./weights/v8_n.pt', model)
     model.cuda()
+
     # Optimizer
     accumulate = max(round(64 / (args.batch_size * args.world_size)), 1)
     params['weight_decay'] *= args.batch_size * args.world_size * accumulate / 64
@@ -57,20 +60,19 @@ def train(args, params):
     ema = util.EMA(model) if args.local_rank == 0 else None
 
     filenames = []
-    for filename in os.listdir('../Dataset/Person/images/train'):
-        filenames.append(f'../Dataset/Person/images/train/{filename}')
+    for filename in os.listdir('../Dataset/CrowdHuman/images/train'):
+        filenames.append('../Dataset/CrowdHuman/images/train/' + filename)
 
+    sampler = None
     dataset = Dataset(filenames, args.input_size, params, True)
 
-    if args.world_size <= 1:
-        sampler = None
-    else:
+    if args.distributed:
         sampler = data.distributed.DistributedSampler(dataset)
 
     loader = data.DataLoader(dataset, args.batch_size, sampler is None, sampler,
                              num_workers=8, pin_memory=True, collate_fn=Dataset.collate_fn)
 
-    if args.world_size > 1:
+    if args.distributed:
         # DDP mode
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = torch.nn.parallel.DistributedDataParallel(module=model,
@@ -89,25 +91,23 @@ def train(args, params):
             writer.writeheader()
         for epoch in range(args.epochs):
             model.train()
-
+            if args.distributed:
+                sampler.set_epoch(epoch)
             if args.epochs - epoch == 10:
                 loader.dataset.mosaic = False
 
-            m_loss = util.AverageMeter()
-            if args.world_size > 1:
-                sampler.set_epoch(epoch)
             p_bar = enumerate(loader)
+
             if args.local_rank == 0:
                 print(('\n' + '%10s' * 3) % ('epoch', 'memory', 'loss'))
             if args.local_rank == 0:
                 p_bar = tqdm.tqdm(p_bar, total=num_batch)  # progress bar
 
             optimizer.zero_grad()
-
-            for i, (samples, targets, _) in p_bar:
+            m_loss = util.AverageMeter()
+            for i, (samples, targets) in p_bar:
                 x = i + num_batch * epoch  # number of iterations
                 samples = samples.cuda().float() / 255
-                targets = targets.cuda()
 
                 # Warmup
                 if x <= num_warmup:
@@ -190,9 +190,9 @@ def train(args, params):
 @torch.no_grad()
 def test(args, params, model=None):
     filenames = []
-    for filename in os.listdir('../Dataset/Person/images/val'):
-        filenames.append(f'../Dataset/Person/images/val/{filename}')
-
+    for filename in os.listdir('../Dataset/CrowdHuman/images/val'):
+        filenames.append('../Dataset/CrowdHuman/images/val/' + filename)
+    numpy.random.shuffle(filenames)
     dataset = Dataset(filenames, args.input_size, params, False)
     loader = data.DataLoader(dataset, 8, False, num_workers=8,
                              pin_memory=True, collate_fn=Dataset.collate_fn)
@@ -213,76 +213,62 @@ def test(args, params, model=None):
     mean_ap = 0.
     metrics = []
     p_bar = tqdm.tqdm(loader, desc=('%10s' * 3) % ('precision', 'recall', 'mAP'))
-    for samples, targets, shapes in p_bar:
+    for samples, targets in p_bar:
         samples = samples.cuda()
-        targets = targets.cuda()
         samples = samples.half()  # uint8 to fp16/32
         samples = samples / 255  # 0 - 255 to 0.0 - 1.0
-        _, _, height, width = samples.shape  # batch size, channels, height, width
-
+        _, _, h, w = samples.shape  # batch size, channels, height, width
+        scale = torch.tensor((w, h, w, h)).cuda()
         # Inference
         outputs = model(samples)
-
         # NMS
-        targets[:, 2:] *= torch.tensor((width, height, width, height)).cuda()  # to pixels
-        outputs = util.non_max_suppression(outputs, 0.001, 0.65)
-
+        outputs = util.non_max_suppression(outputs, 0.001, 0.7, model.head.nc)
         # Metrics
         for i, output in enumerate(outputs):
-            labels = targets[targets[:, 0] == i, 1:]
-            correct = torch.zeros(output.shape[0], n_iou, dtype=torch.bool).cuda()
+            idx = targets['idx'] == i
+            cls = targets['cls'][idx]
+            box = targets['box'][idx]
+
+            cls = cls.cuda()
+            box = box.cuda()
+
+            metric = torch.zeros(output.shape[0], n_iou, dtype=torch.bool).cuda()
 
             if output.shape[0] == 0:
-                if labels.shape[0]:
-                    metrics.append((correct, *torch.zeros((3, 0)).cuda()))
+                if cls.shape[0]:
+                    metrics.append((metric, *torch.zeros((2, 0)).cuda(), cls.squeeze(-1)))
                 continue
-
-            detections = output.clone()
-            util.scale(detections[:, :4], samples[i].shape[1:], shapes[i][0], shapes[i][1])
-
             # Evaluate
-            if labels.shape[0]:
-                tbox = labels[:, 1:5].clone()  # target boxes
-                tbox[:, 0] = labels[:, 1] - labels[:, 3] / 2  # top left x
-                tbox[:, 1] = labels[:, 2] - labels[:, 4] / 2  # top left y
-                tbox[:, 2] = labels[:, 1] + labels[:, 3] / 2  # bottom right x
-                tbox[:, 3] = labels[:, 2] + labels[:, 4] / 2  # bottom right y
-                util.scale(tbox, samples[i].shape[1:], shapes[i][0], shapes[i][1])
-
-                correct = numpy.zeros((detections.shape[0], iou_v.shape[0]))
-                correct = correct.astype(bool)
-
-                t_tensor = torch.cat((labels[:, 0:1], tbox), 1)
-                iou = util.box_iou(t_tensor[:, 1:], detections[:, :4])
-                correct_class = t_tensor[:, 0:1] == detections[:, 5]
-                for j in range(len(iou_v)):
-                    x = torch.where((iou >= iou_v[j]) & correct_class)
-                    if x[0].shape[0]:
-                        matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1)
-                        matches = matches.cpu().numpy()
-                        if x[0].shape[0] > 1:
-                            matches = matches[matches[:, 2].argsort()[::-1]]
-                            matches = matches[numpy.unique(matches[:, 1], return_index=True)[1]]
-                            matches = matches[numpy.unique(matches[:, 0], return_index=True)[1]]
-                        correct[matches[:, 1].astype(int), j] = True
-                correct = torch.tensor(correct, dtype=torch.bool, device=iou_v.device)
-            metrics.append((correct, output[:, 4], output[:, 5], labels[:, 0]))
+            if cls.shape[0]:
+                target = torch.cat((cls, util.wh2xy(box) * scale), 1)
+                metric = util.compute_metric(output[:, :6], target, iou_v)
+            # Append
+            metrics.append((metric, output[:, 4], output[:, 5], cls.squeeze(-1)))
 
     # Compute metrics
     metrics = [torch.cat(x, 0).cpu().numpy() for x in zip(*metrics)]  # to numpy
     if len(metrics) and metrics[0].any():
         tp, fp, m_pre, m_rec, map50, mean_ap = util.compute_ap(*metrics)
-
     # Print results
     print('%10.3g' * 3 % (m_pre, m_rec, mean_ap))
-
     # Return results
     model.float()  # for training
     return map50, mean_ap
 
 
+def profile(args, params):
+    model = nn.yolo_v8_n(len(params['names']))
+    shape = (1, 3, args.input_size, args.input_size)
+
+    model.eval()
+    model(torch.zeros(shape))
+    params = sum(p.numel() for p in model.parameters())
+    if args.local_rank == 0:
+        print(f'Number of parameters: {int(params)}')
+
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = ArgumentParser()
     parser.add_argument('--input-size', default=640, type=int)
     parser.add_argument('--batch-size', default=32, type=int)
     parser.add_argument('--local_rank', default=0, type=int)
@@ -294,8 +280,9 @@ def main():
 
     args.local_rank = int(os.getenv('LOCAL_RANK', 0))
     args.world_size = int(os.getenv('WORLD_SIZE', 1))
+    args.distributed = int(os.getenv('WORLD_SIZE', 1)) > 1
 
-    if args.world_size > 1:
+    if args.distributed:
         torch.cuda.set_device(device=args.local_rank)
         torch.distributed.init_process_group(backend='nccl', init_method='env://')
 
@@ -303,12 +290,9 @@ def main():
         if not os.path.exists('weights'):
             os.makedirs('weights')
 
-    util.setup_seed()
-    util.setup_multi_processes()
-
-    with open(os.path.join('utils', 'args.yaml'), errors='ignore') as f:
+    with open('utils/args.yaml', errors='ignore') as f:
         params = yaml.safe_load(f)
-
+    profile(args, params)
     if args.train:
         train(args, params)
     if args.test:

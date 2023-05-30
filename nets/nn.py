@@ -5,14 +5,6 @@ import torch
 from utils.util import make_anchors
 
 
-def pad(k, p=None, d=1):
-    if d > 1:
-        k = d * (k - 1) + 1
-    if p is None:
-        p = k // 2
-    return p
-
-
 def fuse_conv(conv, norm):
     fused_conv = torch.nn.Conv2d(conv.in_channels,
                                  conv.out_channels,
@@ -34,10 +26,10 @@ def fuse_conv(conv, norm):
 
 
 class Conv(torch.nn.Module):
-    def __init__(self, in_ch, out_ch, k=1, s=1, p=None, d=1, g=1):
+    def __init__(self, in_ch, out_ch, k=1, s=1):
         super().__init__()
-        self.conv = torch.nn.Conv2d(in_ch, out_ch, k, s, pad(k, p, d), d, g, False)
-        self.norm = torch.nn.BatchNorm2d(out_ch, 0.001, 0.03)
+        self.conv = torch.nn.Conv2d(in_ch, out_ch, k, s, (k - 1) // 2, bias=False)
+        self.norm = torch.nn.BatchNorm2d(out_ch, eps=0.001, momentum=0.03)
         self.relu = torch.nn.SiLU(inplace=True)
 
     def forward(self, x):
@@ -89,22 +81,27 @@ class SPP(torch.nn.Module):
 class DarkNet(torch.nn.Module):
     def __init__(self, width, depth):
         super().__init__()
-        p1 = [Conv(width[0], width[1], 3, 2)]
-        p2 = [Conv(width[1], width[2], 3, 2),
-              CSP(width[2], width[2], depth[0])]
-        p3 = [Conv(width[2], width[3], 3, 2),
-              CSP(width[3], width[3], depth[1])]
-        p4 = [Conv(width[3], width[4], 3, 2),
-              CSP(width[4], width[4], depth[2])]
-        p5 = [Conv(width[4], width[5], 3, 2),
-              CSP(width[5], width[5], depth[0]),
-              SPP(width[5], width[5])]
+        self.p1 = []
+        self.p2 = []
+        self.p3 = []
+        self.p4 = []
+        self.p5 = []
+        self.p1.append(Conv(width[0], width[1], 3, 2))
+        self.p2.append(Conv(width[1], width[2], 3, 2))
+        self.p2.append(CSP(width[2], width[2], depth[0]))
+        self.p3.append(Conv(width[2], width[3], 3, 2))
+        self.p3.append(CSP(width[3], width[3], depth[1]))
+        self.p4.append(Conv(width[3], width[4], 3, 2))
+        self.p4.append(CSP(width[4], width[4], depth[2]))
+        self.p5.append(Conv(width[4], width[5], 3, 2))
+        self.p5.append(CSP(width[5], width[5], depth[0]))
+        self.p5.append(SPP(width[5], width[5]))
 
-        self.p1 = torch.nn.Sequential(*p1)
-        self.p2 = torch.nn.Sequential(*p2)
-        self.p3 = torch.nn.Sequential(*p3)
-        self.p4 = torch.nn.Sequential(*p4)
-        self.p5 = torch.nn.Sequential(*p5)
+        self.p1 = torch.nn.Sequential(*self.p1)
+        self.p2 = torch.nn.Sequential(*self.p2)
+        self.p3 = torch.nn.Sequential(*self.p3)
+        self.p4 = torch.nn.Sequential(*self.p4)
+        self.p5 = torch.nn.Sequential(*self.p5)
 
     def forward(self, x):
         p1 = self.p1(x)
@@ -128,16 +125,16 @@ class DarkFPN(torch.nn.Module):
 
     def forward(self, x):
         p3, p4, p5 = x
-        h1 = self.h1(torch.cat([self.up(p5), p4], 1))
-        h2 = self.h2(torch.cat([self.up(h1), p3], 1))
-        h4 = self.h4(torch.cat([self.h3(h2), h1], 1))
-        h6 = self.h6(torch.cat([self.h5(h4), p5], 1))
-        return h2, h4, h6
+        p4 = self.h1(torch.cat([self.up(p5), p4], 1))
+        p3 = self.h2(torch.cat([self.up(p4), p3], 1))
+        p4 = self.h4(torch.cat([self.h3(p3), p4], 1))
+        p5 = self.h6(torch.cat([self.h5(p4), p5], 1))
+        return p3, p4, p5
 
 
 class DFL(torch.nn.Module):
-    # Integral module of Distribution Focal Loss (DFL)
-    # Generalized Focal Loss https://ieeexplore.ieee.org/document/9792391
+    # Generalized Focal Loss
+    # https://ieeexplore.ieee.org/document/9792391
     def __init__(self, ch=16):
         super().__init__()
         self.ch = ch

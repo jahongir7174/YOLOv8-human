@@ -19,12 +19,10 @@ class Dataset(data.Dataset):
         self.input_size = input_size
 
         # Read labels
-        cache = self.load_label(filenames)
-        labels, shapes = zip(*cache.values())
-        self.labels = list(labels)
-        self.shapes = numpy.array(shapes, dtype=numpy.float64)
-        self.filenames = list(cache.keys())  # update
-        self.n = len(shapes)  # number of samples
+        labels = self.load_label(filenames)
+        self.labels = list(labels.values())
+        self.filenames = list(labels.keys())  # update
+        self.n = len(self.filenames)  # number of samples
         self.indices = range(self.n)
         # Albumentations (optional, only used if package is installed)
         self.albumentations = Albumentations()
@@ -36,7 +34,6 @@ class Dataset(data.Dataset):
         mosaic = self.mosaic and random.random() < params['mosaic']
 
         if mosaic:
-            shapes = None
             # Load MOSAIC
             image, label = self.load_mosaic(index, params)
             # MixUp augmentation
@@ -53,16 +50,18 @@ class Dataset(data.Dataset):
 
             # Resize
             image, ratio, pad = resize(image, self.input_size, self.augment)
-            shapes = shape, ((h / shape[0], w / shape[1]), pad)  # for COCO mAP rescaling
 
             label = self.labels[index].copy()
             if label.size:
                 label[:, 1:] = wh2xy(label[:, 1:], ratio[0] * w, ratio[1] * h, pad[0], pad[1])
             if self.augment:
                 image, label = random_perspective(image, label, params)
+
         nl = len(label)  # number of labels
-        if nl:
-            label[:, 1:5] = xy2wh(label[:, 1:5], image.shape[1], image.shape[0])
+        h, w = image.shape[:2]
+        cls = label[:, 0:1]
+        box = label[:, 1:5]
+        box = xy2wh(box, w, h)
 
         if self.augment:
             # Albumentations
@@ -74,22 +73,24 @@ class Dataset(data.Dataset):
             if random.random() < params['flip_ud']:
                 image = numpy.flipud(image)
                 if nl:
-                    label[:, 2] = 1 - label[:, 2]
+                    box[:, 1] = 1 - box[:, 1]
             # Flip left-right
             if random.random() < params['flip_lr']:
                 image = numpy.fliplr(image)
                 if nl:
-                    label[:, 1] = 1 - label[:, 1]
+                    box[:, 0] = 1 - box[:, 0]
 
-        target = torch.zeros((nl, 6))
+        target_cls = torch.zeros((nl, 1))
+        target_box = torch.zeros((nl, 4))
         if nl:
-            target[:, 1:] = torch.from_numpy(label)
+            target_cls = torch.from_numpy(cls)
+            target_box = torch.from_numpy(box)
 
         # Convert HWC to CHW, BGR to RGB
         sample = image.transpose((2, 0, 1))[::-1]
         sample = numpy.ascontiguousarray(sample)
 
-        return torch.from_numpy(sample), target, shapes
+        return torch.from_numpy(sample), target_cls, target_box, torch.zeros(nl)
 
     def __len__(self):
         return len(self.filenames)
@@ -106,10 +107,9 @@ class Dataset(data.Dataset):
 
     def load_mosaic(self, index, params):
         label4 = []
+        border = [-self.input_size // 2, -self.input_size // 2]
         image4 = numpy.full((self.input_size * 2, self.input_size * 2, 3), 0, dtype=numpy.uint8)
         y1a, y2a, x1a, x2a, y1b, y2b, x1b, x2b = (None, None, None, None, None, None, None, None)
-
-        border = [-self.input_size // 2, -self.input_size // 2]
 
         xc = int(random.uniform(-border[0], 2 * self.input_size + border[1]))
         yc = int(random.uniform(-border[0], 2 * self.input_size + border[1]))
@@ -158,9 +158,9 @@ class Dataset(data.Dataset):
                 x2b = min(shape[1], x2a - x1a)
                 y2b = min(y2a - y1a, shape[0])
 
-            image4[y1a:y2a, x1a:x2a] = image[y1b:y2b, x1b:x2b]
             pad_w = x1a - x1b
             pad_h = y1a - y1b
+            image4[y1a:y2a, x1a:x2a] = image[y1b:y2b, x1b:x2b]
 
             # Labels
             label = self.labels[index].copy()
@@ -180,10 +180,20 @@ class Dataset(data.Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        samples, targets, shapes = zip(*batch)
-        for i, item in enumerate(targets):
-            item[:, 0] = i  # add target image index
-        return torch.stack(samples, 0), torch.cat(targets, 0), shapes
+        samples, cls, box, indices = zip(*batch)
+
+        cls = torch.cat(cls, 0)
+        box = torch.cat(box, 0)
+
+        new_indices = list(indices)
+        for i in range(len(indices)):
+            new_indices[i] += i
+        indices = torch.cat(new_indices, 0)
+
+        targets = {'cls': cls,
+                   'box': box,
+                   'idx': indices}
+        return torch.stack(samples, 0), targets
 
     @staticmethod
     def load_label(filenames):
@@ -210,9 +220,9 @@ class Dataset(data.Dataset):
                         label = numpy.array(label, dtype=numpy.float32)
                     nl = len(label)
                     if nl:
-                        assert label.shape[1] == 5, 'labels require 5 columns'
-                        assert (label >= 0).all(), 'negative label values'
-                        assert (label[:, 1:] <= 1).all(), 'non-normalized coordinates'
+                        assert (label >= 0).all()
+                        assert label.shape[1] == 5
+                        assert (label[:, 1:] <= 1).all()
                         _, i = numpy.unique(label, axis=0, return_index=True)
                         if len(i) < nl:  # duplicate row check
                             label = label[i]  # remove duplicates
@@ -221,8 +231,10 @@ class Dataset(data.Dataset):
                 else:
                     label = numpy.zeros((0, 5), dtype=numpy.float32)
                 if filename:
-                    x[filename] = [label, shape]
+                    x[filename] = label
             except FileNotFoundError:
+                pass
+            except AssertionError:
                 pass
         torch.save(x, path)
         return x
@@ -239,7 +251,7 @@ def wh2xy(x, w=640, h=640, pad_w=0, pad_h=0):
     return y
 
 
-def xy2wh(x, w=640, h=640):
+def xy2wh(x, w, h):
     # warning: inplace clip
     x[:, [0, 2]] = x[:, [0, 2]].clip(0, w - 1E-3)  # x1, x2
     x[:, [1, 3]] = x[:, [1, 3]].clip(0, h - 1E-3)  # y1, y2
@@ -277,8 +289,8 @@ def augment_hsv(image, params):
     lut_s = numpy.clip(x * r[1], 0, 255).astype('uint8')
     lut_v = numpy.clip(x * r[2], 0, 255).astype('uint8')
 
-    im_hsv = cv2.merge((cv2.LUT(h, lut_h), cv2.LUT(s, lut_s), cv2.LUT(v, lut_v)))
-    cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR, dst=image)  # no return needed
+    hsv = cv2.merge((cv2.LUT(h, lut_h), cv2.LUT(s, lut_s), cv2.LUT(v, lut_v)))
+    cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR, dst=image)  # no return needed
 
 
 def resize(image, input_size, augment):
@@ -313,14 +325,14 @@ def candidates(box1, box2):
     return (w2 > 2) & (h2 > 2) & (w2 * h2 / (w1 * h1 + 1e-16) > 0.1) & (aspect_ratio < 100)
 
 
-def random_perspective(samples, targets, params, border=(0, 0)):
-    h = samples.shape[0] + border[0] * 2
-    w = samples.shape[1] + border[1] * 2
+def random_perspective(image, label, params, border=(0, 0)):
+    h = image.shape[0] + border[0] * 2
+    w = image.shape[1] + border[1] * 2
 
     # Center
     center = numpy.eye(3)
-    center[0, 2] = -samples.shape[1] / 2  # x translation (pixels)
-    center[1, 2] = -samples.shape[0] / 2  # y translation (pixels)
+    center[0, 2] = -image.shape[1] / 2  # x translation (pixels)
+    center[1, 2] = -image.shape[0] / 2  # y translation (pixels)
 
     # Perspective
     perspective = numpy.eye(3)
@@ -344,39 +356,39 @@ def random_perspective(samples, targets, params, border=(0, 0)):
     # Combined rotation matrix, order of operations (right to left) is IMPORTANT
     matrix = translate @ shear @ rotate @ perspective @ center
     if (border[0] != 0) or (border[1] != 0) or (matrix != numpy.eye(3)).any():  # image changed
-        samples = cv2.warpAffine(samples, matrix[:2], dsize=(w, h), borderValue=(0, 0, 0))
+        image = cv2.warpAffine(image, matrix[:2], dsize=(w, h), borderValue=(0, 0, 0))
 
     # Transform label coordinates
-    n = len(targets)
+    n = len(label)
     if n:
         xy = numpy.ones((n * 4, 3))
-        xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
+        xy[:, :2] = label[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
         xy = xy @ matrix.T  # transform
         xy = xy[:, :2].reshape(n, 8)  # perspective rescale or affine
 
         # create new boxes
         x = xy[:, [0, 2, 4, 6]]
         y = xy[:, [1, 3, 5, 7]]
-        new = numpy.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
+        box = numpy.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
 
         # clip
-        new[:, [0, 2]] = new[:, [0, 2]].clip(0, w)
-        new[:, [1, 3]] = new[:, [1, 3]].clip(0, h)
-
+        box[:, [0, 2]] = box[:, [0, 2]].clip(0, w)
+        box[:, [1, 3]] = box[:, [1, 3]].clip(0, h)
         # filter candidates
-        indices = candidates(box1=targets[:, 1:5].T * s, box2=new.T)
-        targets = targets[indices]
-        targets[:, 1:5] = new[indices]
+        indices = candidates(box1=label[:, 1:5].T * s, box2=box.T)
 
-    return samples, targets
+        label = label[indices]
+        label[:, 1:5] = box[indices]
+
+    return image, label
 
 
-def mix_up(image1, label1, image2, label2):
+def mix_up(image1, box1, image2, box2):
     # Applies MixUp augmentation https://arxiv.org/pdf/1710.09412.pdf
     alpha = numpy.random.beta(32.0, 32.0)  # mix-up ratio, alpha=beta=32.0
     image = (image1 * alpha + image2 * (1 - alpha)).astype(numpy.uint8)
-    label = numpy.concatenate((label1, label2), 0)
-    return image, label
+    box = numpy.concatenate((box1, box2), 0)
+    return image, box
 
 
 class Albumentations:
