@@ -577,7 +577,7 @@ class ComputeLoss:
         loss[1] *= self.params['box']  # box gain
         loss[2] *= self.params['dfl']  # dfl gain
 
-        return loss.sum()
+        return loss[1], loss[0], loss[2]
 
     @staticmethod
     def box_decode(anchor_points, pred_dist, project):

@@ -65,8 +65,8 @@ class Dataset(data.Dataset):
 
         if self.augment:
             # Albumentations
-            image, label = self.albumentations(image, label)
-            nl = len(label)  # update after albumentations
+            image, box, cls = self.albumentations(image, box, cls)
+            nl = len(box)  # update after albumentations
             # HSV color-space
             augment_hsv(image, params)
             # Flip up-down
@@ -395,23 +395,24 @@ class Albumentations:
     def __init__(self):
         self.transform = None
         try:
-            import albumentations as album
+            import albumentations
 
-            transforms = [album.Blur(p=0.01),
-                          album.CLAHE(p=0.01),
-                          album.ToGray(p=0.01),
-                          album.MedianBlur(p=0.01)]
-            self.transform = album.Compose(transforms,
-                                           album.BboxParams('yolo', ['class_labels']))
+            transforms = [albumentations.Blur(p=0.01),
+                          albumentations.CLAHE(p=0.01),
+                          albumentations.ToGray(p=0.01),
+                          albumentations.MedianBlur(p=0.01)]
+            self.transform = albumentations.Compose(transforms,
+                                                    albumentations.BboxParams('yolo', ['class_labels']))
 
         except ImportError:  # package not installed, skip
             pass
 
-    def __call__(self, image, label):
+    def __call__(self, image, box, cls):
         if self.transform:
             x = self.transform(image=image,
-                               bboxes=label[:, 1:],
-                               class_labels=label[:, 0])
+                               bboxes=box,
+                               class_labels=cls)
             image = x['image']
-            label = numpy.array([[c, *b] for c, b in zip(x['class_labels'], x['bboxes'])])
-        return image, label
+            box = numpy.array(x['bboxes'])
+            cls = numpy.array(x['class_labels'])
+        return image, box, cls

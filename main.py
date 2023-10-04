@@ -70,7 +70,7 @@ def train(args, params):
         sampler = data.distributed.DistributedSampler(dataset)
 
     loader = data.DataLoader(dataset, args.batch_size, sampler is None, sampler,
-                             num_workers=8, pin_memory=True, collate_fn=Dataset.collate_fn)
+                             num_workers=4, pin_memory=True, collate_fn=Dataset.collate_fn)
 
     if args.distributed:
         # DDP mode
@@ -87,7 +87,9 @@ def train(args, params):
     num_warmup = max(round(params['warmup_epochs'] * num_batch), 1000)
     with open('weights/step.csv', 'w') as f:
         if args.local_rank == 0:
-            writer = csv.DictWriter(f, fieldnames=['epoch', 'mAP@50', 'mAP'])
+            writer = csv.DictWriter(f, fieldnames=['epoch',
+                                                   'box', 'dfl', 'cls',
+                                                   'Recall', 'Precision', 'mAP@50', 'mAP'])
             writer.writeheader()
         for epoch in range(args.epochs):
             model.train()
@@ -99,12 +101,14 @@ def train(args, params):
             p_bar = enumerate(loader)
 
             if args.local_rank == 0:
-                print(('\n' + '%10s' * 3) % ('epoch', 'memory', 'loss'))
+                print(('\n' + '%10s' * 5) % ('epoch', 'memory', 'box', 'cls', 'dfl'))
             if args.local_rank == 0:
                 p_bar = tqdm.tqdm(p_bar, total=num_batch)  # progress bar
 
             optimizer.zero_grad()
-            m_loss = util.AverageMeter()
+            avg_box_loss = util.AverageMeter()
+            avg_dfl_loss = util.AverageMeter()
+            avg_cls_loss = util.AverageMeter()
             for i, (samples, targets) in p_bar:
                 x = i + num_batch * epoch  # number of iterations
                 samples = samples.cuda().float() / 255
@@ -127,15 +131,21 @@ def train(args, params):
                 # Forward
                 with torch.cuda.amp.autocast():
                     outputs = model(samples)  # forward
-                loss = criterion(outputs, targets)
+                    loss_box, loss_cls, loss_dfl = criterion(outputs, targets)
 
-                m_loss.update(loss.item(), samples.size(0))
+                avg_box_loss.update(loss_box.item(), samples.size(0))
+                avg_dfl_loss.update(loss_box.item(), samples.size(0))
+                avg_cls_loss.update(loss_cls.item(), samples.size(0))
 
-                loss *= args.batch_size  # loss scaled by batch_size
-                loss *= args.world_size  # gradient averaged between devices in DDP mode
+                loss_box *= args.batch_size  # loss scaled by batch_size
+                loss_dfl *= args.batch_size  # loss scaled by batch_size
+                loss_cls *= args.batch_size  # loss scaled by batch_size
+                loss_box *= args.world_size  # gradient averaged between devices in DDP mode
+                loss_dfl *= args.world_size  # gradient averaged between devices in DDP mode
+                loss_cls *= args.world_size  # gradient averaged between devices in DDP mode
 
                 # Backward
-                amp_scale.scale(loss).backward()
+                amp_scale.scale(loss_box + loss_cls + loss_dfl).backward()
 
                 # Optimize
                 if x % accumulate == 0:
@@ -150,11 +160,9 @@ def train(args, params):
                 # Log
                 if args.local_rank == 0:
                     memory = f'{torch.cuda.memory_reserved() / 1E9:.3g}G'  # (GB)
-                    s = ('%10s' * 2 + '%10.4g') % (f'{epoch + 1}/{args.epochs}', memory, m_loss.avg)
+                    s = ('%10s' * 2 + '%10.3g' * 3) % (f'{epoch + 1}/{args.epochs}', memory,
+                                                       avg_box_loss.avg, avg_cls_loss.avg, avg_dfl_loss.avg)
                     p_bar.set_description(s)
-
-                del loss
-                del outputs
 
             # Scheduler
             scheduler.step()
@@ -162,23 +170,28 @@ def train(args, params):
             if args.local_rank == 0:
                 # mAP
                 last = test(args, params, ema.ema)
-                writer.writerow({'mAP': str(f'{last[1]:.3f}'),
-                                 'epoch': str(epoch + 1).zfill(3),
-                                 'mAP@50': str(f'{last[0]:.3f}')})
+                writer.writerow({'epoch': str(epoch + 1).zfill(3),
+                                 'box': str(f'{avg_box_loss.avg:.3f}'),
+                                 'cls': str(f'{avg_cls_loss.avg:.3f}'),
+                                 'dfl': str(f'{avg_dfl_loss.avg:.3f}'),
+                                 'mAP': str(f'{last[0]:.3f}'),
+                                 'mAP@50': str(f'{last[1]:.3f}'),
+                                 'Recall': str(f'{last[2]:.3f}'),
+                                 'Precision': str(f'{last[2]:.3f}')})
                 f.flush()
 
                 # Update best mAP
-                if last[1] > best:
-                    best = last[1]
+                if last[0] > best:
+                    best = last[0]
 
                 # Save model
-                ckpt = {'model': copy.deepcopy(ema.ema).half()}
+                save = {'model': copy.deepcopy(ema.ema).half()}
 
                 # Save last, best and delete
-                torch.save(ckpt, './weights/last.pt')
-                if best == last[1]:
-                    torch.save(ckpt, './weights/best.pt')
-                del ckpt
+                torch.save(save, './weights/last.pt')
+                if best == last[0]:
+                    torch.save(save, './weights/best.pt')
+                del save
 
     if args.local_rank == 0:
         util.strip_optimizer('./weights/best.pt')  # strip optimizers
@@ -194,7 +207,7 @@ def test(args, params, model=None):
         filenames.append('../Dataset/CrowdHuman/images/val/' + filename)
     numpy.random.shuffle(filenames)
     dataset = Dataset(filenames, args.input_size, params, False)
-    loader = data.DataLoader(dataset, 8, False, num_workers=8,
+    loader = data.DataLoader(dataset, 8, False, num_workers=4,
                              pin_memory=True, collate_fn=Dataset.collate_fn)
 
     if model is None:
@@ -212,11 +225,11 @@ def test(args, params, model=None):
     map50 = 0.
     mean_ap = 0.
     metrics = []
-    p_bar = tqdm.tqdm(loader, desc=('%10s' * 3) % ('precision', 'recall', 'mAP'))
+    p_bar = tqdm.tqdm(loader, desc=('%10s' * 5) % ('', 'precision', 'recall', 'mAP50', 'mAP'))
     for samples, targets in p_bar:
         samples = samples.cuda()
         samples = samples.half()  # uint8 to fp16/32
-        samples = samples / 255  # 0 - 255 to 0.0 - 1.0
+        samples = samples / 255.  # 0 - 255 to 0.0 - 1.0
         _, _, h, w = samples.shape  # batch size, channels, height, width
         scale = torch.tensor((w, h, w, h)).cuda()
         # Inference
@@ -250,10 +263,10 @@ def test(args, params, model=None):
     if len(metrics) and metrics[0].any():
         tp, fp, m_pre, m_rec, map50, mean_ap = util.compute_ap(*metrics)
     # Print results
-    print('%10.3g' * 3 % (m_pre, m_rec, mean_ap))
+    print(('%10s' + '%10.3g' * 4) % ("", m_pre, m_rec, map50, mean_ap))
     # Return results
     model.float()  # for training
-    return map50, mean_ap
+    return mean_ap, map50, m_rec, m_pre
 
 
 @torch.no_grad()
