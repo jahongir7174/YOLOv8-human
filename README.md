@@ -23,13 +23,13 @@ pip install tqdm
 
 ### Results
 
-| Version |                                                                              COCO weights |
-|:-------:|------------------------------------------------------------------------------------------:|
-|  v8_n   | [model](https://github.com/jahongir7174/YOLOv8-pt/releases/download/v0.0.1-alpha/v8_n.pt) |
-|  v8_s   | [model](https://github.com/jahongir7174/YOLOv8-pt/releases/download/v0.0.1-alpha/v8_s.pt) |
-|  v8_m   | [model](https://github.com/jahongir7174/YOLOv8-pt/releases/download/v0.0.1-alpha/v8_m.pt) |
-|  v8_l   | [model](https://github.com/jahongir7174/YOLOv8-pt/releases/download/v0.0.1-alpha/v8_l.pt) |
-|  v8_x   | [model](https://github.com/jahongir7174/YOLOv8-pt/releases/download/v0.0.1-alpha/v8_x.pt) |
+| Version |                                                                              COCO weights |         CrowdHuman weights |
+|:-------:|------------------------------------------------------------------------------------------:|---------------------------:|
+|  v8_n   | [model](https://github.com/jahongir7174/YOLOv8-pt/releases/download/v0.0.1-alpha/v8_n.pt) | [model](./weights/best.pt) |
+|  v8_s   | [model](https://github.com/jahongir7174/YOLOv8-pt/releases/download/v0.0.1-alpha/v8_s.pt) |                          - |
+|  v8_m   | [model](https://github.com/jahongir7174/YOLOv8-pt/releases/download/v0.0.1-alpha/v8_m.pt) |                          - |
+|  v8_l   | [model](https://github.com/jahongir7174/YOLOv8-pt/releases/download/v0.0.1-alpha/v8_l.pt) |                          - |
+|  v8_x   | [model](https://github.com/jahongir7174/YOLOv8-pt/releases/download/v0.0.1-alpha/v8_x.pt) |                          - |
 
 * the weights are ported from original repo, see reference
 
