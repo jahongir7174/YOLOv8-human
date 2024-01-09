@@ -25,9 +25,6 @@ def learning_rate(args, params):
 
 
 def train(args, params):
-    util.setup_seed()
-    util.setup_multi_processes()
-
     # Model
     model = nn.yolo_v8_n(len(params['names']))
     model = util.load_weight('./weights/v8_n.pt', model)
@@ -206,8 +203,8 @@ def test(args, params, model=None):
     for filename in os.listdir('../Dataset/CrowdHuman/images/val'):
         filenames.append('../Dataset/CrowdHuman/images/val/' + filename)
     numpy.random.shuffle(filenames)
-    dataset = Dataset(filenames, args.input_size, params, False)
-    loader = data.DataLoader(dataset, 8, False, num_workers=4,
+    dataset = Dataset(filenames, args.input_size, params, augment=False)
+    loader = data.DataLoader(dataset, batch_size=8, shuffle=False, num_workers=4,
                              pin_memory=True, collate_fn=Dataset.collate_fn)
 
     if model is None:
@@ -388,7 +385,12 @@ def main():
 
     with open('utils/args.yaml', errors='ignore') as f:
         params = yaml.safe_load(f)
+
+    util.setup_seed()
+    util.setup_multi_processes()
+
     profile(args, params)
+
     if args.train:
         train(args, params)
     if args.test:
