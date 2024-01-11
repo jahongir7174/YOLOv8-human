@@ -1,7 +1,7 @@
 import copy
 import math
 import random
-import time
+from time import time
 
 import numpy
 import torch
@@ -124,15 +124,13 @@ def non_max_suppression(outputs, conf_threshold, iou_threshold, nc):
     max_nms = 30000
 
     bs = outputs.shape[0]  # batch size
-    nc = nc or (outputs.shape[1] - 4)  # number of classes
-    nm = outputs.shape[1] - nc - 4
-    mi = 4 + nc  # mask start index
-    xc = outputs[:, 4:mi].amax(1) > conf_threshold  # candidates
+    nc = outputs.shape[1] - 4  # number of classes
+    xc = outputs[:, 4:4 + nc].amax(1) > conf_threshold  # candidates
 
-    # Settings
-    time_limit = 0.5 + 0.05 * bs  # seconds to quit after
-    t = time.time()
-    output = [torch.zeros((0, 6 + nm), device=outputs.device)] * bs
+    start = time()
+    limit = 0.5 + 0.05 * bs  # seconds to quit after
+
+    output = [torch.zeros((0, 6), device=outputs.device)] * bs
     for index, x in enumerate(outputs):  # image index, image inference
         x = x.transpose(0, -1)[xc[index]]  # confidence
 
@@ -140,19 +138,16 @@ def non_max_suppression(outputs, conf_threshold, iou_threshold, nc):
         if not x.shape[0]:
             continue
 
-        # Detections matrix nx6 (xyxy, conf, cls)
-        box, cls, mask = x.split((4, nc, nm), 1)
-        box = wh2xy(box)  # center_x, center_y, width, height) to (x1, y1, x2, y2)
+        box, cls = x.split((4, nc), 1)
+        box = wh2xy(box)  # (cx, cy, w, h) to (x1, y1, x2, y2)
         if nc > 1:
             i, j = (cls > conf_threshold).nonzero(as_tuple=False).T
-            x = torch.cat((box[i], x[i, 4 + j, None], j[:, None].float(), mask[i]), 1)
+            x = torch.cat((box[i], x[i, 4 + j, None], j[:, None].float()), 1)
         else:  # best class only
             conf, j = cls.max(1, keepdim=True)
-            x = torch.cat((box, conf, j.float(), mask), 1)[conf.view(-1) > conf_threshold]
+            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_threshold]
 
-        # Check shape
-        n = x.shape[0]  # number of boxes
-        if not n:  # no boxes
+        if not x.shape[0]:  # no boxes
             continue
         x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence and remove excess boxes
 
@@ -163,7 +158,7 @@ def non_max_suppression(outputs, conf_threshold, iou_threshold, nc):
         i = i[:max_det]  # limit detections
 
         output[index] = x[i]
-        if (time.time() - t) > time_limit:
+        if (time() - start) > limit:
             break  # time limit exceeded
 
     return output
