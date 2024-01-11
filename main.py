@@ -232,7 +232,7 @@ def test(args, params, model=None):
         # Inference
         outputs = model(samples)
         # NMS
-        outputs = util.non_max_suppression(outputs, 0.001, 0.7, model.head.nc)
+        outputs = util.non_max_suppression(outputs, 0.001, 0.7)
         # Metrics
         for i, output in enumerate(outputs):
             idx = targets['idx'] == i
@@ -318,7 +318,7 @@ def demo(args):
             # Inference
             outputs = model(x)
             # NMS
-            outputs = util.non_max_suppression(outputs, 0.25, 0.7, model.head.nc)
+            outputs = util.non_max_suppression(outputs, 0.25, 0.7)
             for output in outputs:
                 output[:, [0, 2]] -= w  # x padding
                 output[:, [1, 3]] -= h  # y padding

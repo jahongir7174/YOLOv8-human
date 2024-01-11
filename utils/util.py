@@ -118,7 +118,7 @@ def compute_metric(output, target, iou_v):
     return torch.tensor(correct, dtype=torch.bool, device=output.device)
 
 
-def non_max_suppression(outputs, conf_threshold, iou_threshold, nc):
+def non_max_suppression(outputs, conf_threshold, iou_threshold):
     max_wh = 7680
     max_det = 300
     max_nms = 30000
